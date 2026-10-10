@@ -1,0 +1,14 @@
+# Never commit secrets, credentials, or environment-specific identity
+*registration*.json
+*.kubeconfig
+kubeconfig*
+*.key
+*.pem
+.env
+.env.*
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

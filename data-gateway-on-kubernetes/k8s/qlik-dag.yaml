@@ -1,0 +1,234 @@
+# Qlik Data Gateway (Direct Access) on Kubernetes (k3s)
+# Translated from Qlik's docker-compose bundle. Outbound-only; no Service/Ingress needed.
+#
+# Before applying, change:
+#   - storageClassName (local-path is k3s's built-in; use your cluster's class)
+#   - ALLOW_SOURCES    (the private ranges / domains your data sources live on)
+#   - image tags + the dcaas-dg env block: match them to YOUR compose bundle,
+#     do not hand-write them from here (Qlik changes them between versions).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qlik-dag
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qlik-dag-agent-data          # holds the registration identity (cfgrepo.sqlite) + logs
+  namespace: qlik-dag
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path       # <-- change to your StorageClass
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qlik-dag-gateway-config      # /usr/share/Qlik/Gateway (connector config + CA bundles)
+  namespace: qlik-dag
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path       # <-- change to your StorageClass
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qlik-dag
+  namespace: qlik-dag
+  labels:
+    app: qlik-dag
+spec:
+  replicas: 1                        # a Data Gateway is ONE registered node; never scale it
+  strategy:
+    type: Recreate                   # release the RWO PVC before the new pod starts
+  selector:
+    matchLabels:
+      app: qlik-dag
+  template:
+    metadata:
+      labels:
+        app: qlik-dag
+    spec:
+      securityContext:
+        runAsUser: 13600             # both Qlik containers run/write as 13600
+        runAsGroup: 13600
+        fsGroup: 13600               # makes the PVCs group-writable by 13600
+      hostAliases:
+        # GOTCHA: in one Pod the two containers share localhost. Keep every Qlik env var
+        # exactly as the compose has it and map the compose service names to loopback here.
+        - ip: "127.0.0.1"
+          hostnames: ["direct-access-agent-1", "dcaas-dg-1"]
+      initContainers:
+        # GOTCHA: k8s does NOT auto-populate a volume from the image like Docker does.
+        #  - seed /usr/share/Qlik/Gateway from the image so the empty PVC doesn't mask it
+        #  - create /.dockerenv so the gateway detects "container" (containerd doesn't make it)
+        - name: seed-config
+          image: ghcr.io/qlik-download/direct-access-agent:1.8.0
+          securityContext:
+            runAsUser: 0             # root, to cp -a and touch the flag
+            runAsGroup: 0
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ ! -e /seed-gw/configuration.properties ]; then
+                echo "seeding gateway-config from image"
+                cp -a /usr/share/Qlik/Gateway/. /seed-gw/
+              else
+                echo "gateway-config already present"
+              fi
+              mkdir -p /seed-data/logs /seed-data/ssl
+              chown -R 13600:13600 /seed-data /seed-gw
+              touch /seed-dflag/.dockerenv
+          volumeMounts:
+            - name: gateway-config
+              mountPath: /seed-gw
+            - name: agent-data
+              mountPath: /seed-data
+            - name: dockerflag
+              mountPath: /seed-dflag
+      containers:
+        # ---- container 0: dcaas-dg (dials the tenant) ----
+        - name: dcaas-dg
+          image: ghcr.io/qlik-download/dcaas-dg:6.70.0
+          env:
+            - name: REGION
+              value: "local"
+            - name: NODE_ENV
+              value: "enterprise"
+            - name: ENABLE_TEMPORARY_NODE_URL
+              value: "true"
+            - name: ENABLE_NATS
+              value: "false"
+            - name: ENABLE_JWT_AUTH
+              value: "false"
+            - name: ENABLE_FAKE_USER
+              value: "true"
+            - name: EMULATE_STORAGE_PROVIDER
+              value: "false"
+            - name: NEW_DATA_CONNECTION_SERVICE
+              value: "http://direct-access-agent-1:5050"
+            - name: JWKS_ENDPOINT
+              value: "http://dcjwks:1084/.well-known/jwks.json"   # unused (JWT auth off)
+            - name: CONNECTOR_SERVICE
+              value: "direct-access-agent-1:50070 direct-access-agent-1:50320 direct-access-agent-1:50310"
+            - name: ENABLE_FEATUREFLAG_FILTERING
+              value: "false"
+            - name: FEATURE_FLAGS_URI
+              value: "http://feature-flags:8080"                  # unused (filtering off)
+            - name: ENABLE_TENANTRULE_FILTERING
+              value: "false"
+            - name: ENABLE_LICENSE_FILTERING
+              value: "false"
+            - name: ENABLE_METADATA_API
+              value: "true"
+            - name: ENABLE_POD_LOADBALANCING
+              value: "false"
+            - name: LISTENING_HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "9027"
+            - name: AGENT_PORT
+              value: "5050"
+            - name: DCAAS_LOG_FILE_PATH
+              value: "/usr/data/logs/dcaas_logs.txt"
+          ports:
+            - containerPort: 9027
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9027
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9027
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              memory: "2Gi"
+          volumeMounts:
+            - name: agent-data
+              mountPath: /usr/data
+        # ---- container 1: direct-access-agent (connector runtime) ----
+        # NOTE: the register-gateway.sh helper patches container index 1 (this one).
+        - name: direct-access-agent
+          image: ghcr.io/qlik-download/direct-access-agent:1.8.0
+          env:
+            - name: DCAAS_URL
+              value: "http://dcaas-dg-1:9027"
+            - name: LINUX_CONTAINER
+              value: "true"            # NOTE: this does NOT gate the connector list; /.dockerenv does
+            - name: DATA_HOST
+              value: "0.0.0.0"
+            - name: STANDALONE
+              value: "false"
+            - name: ENABLE_SHUTDOWN_DRAIN
+              value: "true"
+            - name: HOST_IP
+              value: "direct-access-agent-1"   # resolves to 127.0.0.1 via hostAliases
+            - name: SERVICE_MODE
+              value: "true"
+            - name: RELOAD_SESSION_LIFE
+              value: "5"
+            - name: REUSE_RELOAD_SESSION
+              value: "true"
+            - name: DESTROY_SESSION_CANCEL
+              value: "mssql"
+            - name: DRIVER_CONNECTION_PARAMETERS
+              value: '{"snowflake":{"QUERY_TAG":"IntegrationTests"}}'
+            - name: HOST_MODE
+              value: "0"
+            - name: ALLOW_SOURCES
+              # <-- change to the private ranges / domains your data sources live on
+              value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,*.example.com"
+            - name: LOG_LEVEL
+              value: "INFO"
+          ports:
+            - containerPort: 5050
+            - containerPort: 5052
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          volumeMounts:
+            - name: agent-data
+              mountPath: /usr/data
+            - name: gateway-config
+              mountPath: /usr/share/Qlik/Gateway
+            - name: tmp
+              mountPath: /tmp
+            - name: dockerflag                 # GOTCHA: make the gateway see it's in a container
+              mountPath: /.dockerenv
+              subPath: .dockerenv
+              readOnly: true
+      volumes:
+        - name: agent-data
+          persistentVolumeClaim:
+            claimName: qlik-dag-agent-data
+        - name: gateway-config
+          persistentVolumeClaim:
+            claimName: qlik-dag-gateway-config
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        - name: dockerflag
+          emptyDir: {}
